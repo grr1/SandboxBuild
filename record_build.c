@@ -9,10 +9,13 @@
 
  */
 
+#include <errno.h>
+#include <libgen.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -64,7 +67,8 @@ void TARGET_add_dep(target *tar, char *new_dep) {
 }
 
 /*
- *
+ * Emits information for one target and its command and dependencies
+ * to the dependency.txt file
  */
 void emit_target_to_file( FILE *file, target *tar ) {
   fprintf(file, "TARGET:  %s\n", tar->target_name);
@@ -75,7 +79,7 @@ void emit_target_to_file( FILE *file, target *tar ) {
   int line_len = 12;
   do {
     // formatting
-    if ( line_len > 80 ) {
+    if ( line_len + strlen(copy->dep) > 80 ) {
       fprintf(file, "\n            ");
       line_len = 12;
     }
@@ -85,6 +89,98 @@ void emit_target_to_file( FILE *file, target *tar ) {
   } while ( copy != NULL );
   fprintf(file, "\n");
 }
+
+/*
+ * Helper function for creating subdirectories recursively from a given filepath
+ * dirpath: the absolute filepath of the the dependency to be copied from
+ * sandboxDir: the absolute filepath of the sandbox directory to copy to
+ */
+void dep_mkdirs(char *dirpath, char *sandboxDir) {
+
+  fprintf(stderr, "DIRPATH: %s+\n", dirpath);
+  fprintf(stderr, "SANDBOX: %s+\n", sandboxDir);
+  char *full_path = malloc(strlen(dirpath) + strlen(sandboxDir) + 100);
+  strcpy(full_path, sandboxDir);
+  strcat(full_path, dirpath);
+  struct stat statbf;
+  char *dirpath_cpy = strdup(dirpath);
+  char *dname = dirname(dirpath_cpy);
+  if ( strcmp(dname, ".") &&
+       ( stat(dname, &statbf) != 0 || !S_ISDIR(statbf.st_mode) ) ) {
+    //recursively make the parent directories before making this directory
+    dep_mkdirs(dname, sandboxDir);
+  }
+  free(dirpath_cpy);
+  fprintf(stderr, "fullpath before making: %s+\n", full_path);
+  int ret = mkdir(dirpath, 0777);
+  fprintf(stderr, "mkdir ret: %d\n", ret);
+  fprintf(stderr, "mkdir errno: %d\n", errno);
+  free(full_path);
+}
+
+/*
+ * Helper function to create copies of the dependency files for the given
+ * target in the given sandbox directory
+ */
+void TARGET_copy_deps(target *tar, char *sandbox_pwd) {
+  depnode *copy = tar->head;
+  while ( copy != NULL ) {
+    //fprintf(stderr, "DEP FILE: %s+\n", copy->dep);
+    // the original source dependency to copy from
+    FILE *depfile = fopen(copy->dep, "r");
+    if ( depfile == NULL ) {
+      fprintf(stderr, "ERROR: Dependency file %s could not be opened to copy!\n", copy->dep);
+      copy = copy->next;
+      continue;
+    }
+    // create a new copy of the dependency file to write to
+    // pwd/dep
+    char *new_path = malloc(strlen(sandbox_pwd) + 2 + strlen(copy->dep));
+    strcpy(new_path, sandbox_pwd);
+    if ( copy->dep[0] != '/') {
+      *(new_path + strlen(sandbox_pwd)) = '/';
+      *(new_path + strlen(sandbox_pwd) + 1) = '\0';
+    }
+    // append dep filepath onto pwd to create abs filepath
+    // for the sandbox copy
+    strcat(new_path, copy->dep);
+    *(new_path + strlen(sandbox_pwd) + strlen(copy->dep) + 1) = '\0';
+    //fprintf(stderr, "NEW PATH: %s+\n", new_path);
+    //create subdirs if not exist alr
+    if ( strcmp(basename(new_path), new_path) ) {
+      //dependency has a directory in its filepath, need to check if those directories exist
+      struct stat stat_result;
+      char *new_path_cpy = strdup(new_path);
+      char *copy_dname = dirname(new_path_cpy);
+      if ( stat(copy_dname, &stat_result) != 0 || !S_ISDIR(stat_result.st_mode) ) {
+        //subdir in sandbox does not exist, need to make it
+        dep_mkdirs(copy_dname, sandbox_pwd);
+      }
+      free(new_path_cpy);
+    }
+    FILE *towrite = fopen(new_path, "w");
+    if ( towrite == NULL ) {
+      fprintf(stderr, "ERROR: Sandbox copy, %s, of dependency %s could not be opened!\n\n",
+                new_path, copy->dep);
+      copy = copy->next;
+      continue;
+    }
+    // copy from the dependency file to the towrite copy
+    char *read_buffer = malloc(BUFFER_SIZE);
+    int bytes_read = -1;
+    do {
+      //read 512 items of 1 byte each
+      bytes_read = fread(read_buffer, 1, BUFFER_SIZE, depfile);
+      fwrite(read_buffer, 1, bytes_read, towrite);
+    } while ( bytes_read > 0);
+    free(read_buffer);
+    fclose(depfile);
+    fclose(towrite);
+    copy = copy->next;
+  }
+}
+
+
 
 /*
  * linked list node struct to hold a process id and its associated filepath
@@ -262,6 +358,13 @@ const char *dependency_file_name = "dependency.txt";
 
 
 int main(int argc, char *argv) {
+  
+  //dep_mkdirs("/test/dir1/dir2/dir3", "/u/riker/u93/asehr/cs252/lab4-src/sandbox");
+  //dep_mkdirs("/test/dir1/dir2/dir4", "/u/riker/u93/asehr/cs252/lab4-src/sandbox");
+  //dep_mkdirs("/test/dir1/dir2/dir3", "/u/riker/u93/asehr/cs252/lab4-src/sandbox");
+
+
+
 
   // argv: "record-build" [targets]
   // execvp("/usr/bin/strace", ["/usr/bin/strace", "-f", "-o", "t.out", "make", [targets]);
@@ -346,6 +449,13 @@ int main(int argc, char *argv) {
   // used to remove repeated dependencies, and for copying into sandbox
   target *cur_target = NULL;
 
+  // create a new directory for the sandbox dependencies to be copied into
+  char *sandbox_pwd = malloc(strlen(pwd) + 9);
+  strcpy(sandbox_pwd, pwd);
+  strcat(sandbox_pwd, "/");
+  strcat(sandbox_pwd, "sandbox");
+  int status = mkdir(sandbox_pwd, 0777);
+
   //read one line in and compare it with the target format
   while(!feof(in_file) && fgets(buffer, sizeof(buffer), in_file) != NULL ) {
     // discard any lines that return -1 ENOENT, as these are commands that failed
@@ -414,6 +524,8 @@ int main(int argc, char *argv) {
             fprintf(stderr, "EMITTING TARGET\n");
             emit_target_to_file(dep_file, cur_target);
             //TODO: copy the previous target's dependency files to sandbox
+            // make a new directory
+            TARGET_copy_deps(cur_target, sandbox_pwd);
           }
           int i;
           int cmd_index = 0;
@@ -469,7 +581,7 @@ int main(int argc, char *argv) {
           //ignore locale files being opened
           if ( strstr(openat, "locale") == NULL && strstr(openat, "/etc/") == NULL &&
                strstr(openat, "/types/") == NULL && strstr(openat, ".cache") == NULL &&
-               strstr(openat, "/bits/") == NULL ) {
+               strstr(openat, "/bits/") == NULL  && strstr(openat, "/tmp/") == NULL) {
             openat += 18; // cut off "openat(AT_FDCWD, \""
             for ( int i = 0; i < strlen(openat); i++ ) {
               if ( openat[i] == '\"' ) {
@@ -477,14 +589,7 @@ int main(int argc, char *argv) {
                 break;
               }
             }
-            /*
-            //check if dependency line length goes over 90 with this new depency
-            if ( dep_length + strlen(openat) > 100 ) {
-              dep_length = 12;
-            }
-            */
             TARGET_add_dep(cur_target, openat);
-            //dep_length += strlen(openat);
           }
         }
         else {
@@ -499,6 +604,12 @@ int main(int argc, char *argv) {
       } //end else (chdir match)
     } // end else (sscanf match);
   } // end while
+
+  //emit the last target
+  if ( cur_target != NULL ) {
+    emit_target_to_file(dep_file, cur_target);
+    TARGET_copy_deps(cur_target, sandbox_pwd);
+  }
 
   //close opened files
   fclose(in_file);
