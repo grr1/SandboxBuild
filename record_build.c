@@ -67,6 +67,21 @@ void TARGET_add_dep(target *tar, char *new_dep) {
 }
 
 /*
+ * Emits the information needed to build one target to the generated sandbox makefile
+ * params:
+ *    file: the file pointer to the generated makefile in the sandbox dir
+ *    tar:  pointer to the target struct containing the information to be writen
+ */
+void emit_target_to_makefile(FILE *file, target *tar) {
+  // first file is the local dependency
+  // ex: target: target.cc
+  fprintf(file, "\n%s: %s\n", tar->target_name, tar->head->dep);
+  // write the command to execute for this target
+  //TODO: need to change to track multiple commands
+  fprintf(file, "\t%s\n",tar->cmd); 
+}
+
+/*
  * Emits information for one target and its command and dependencies
  * to the dependency.txt file
  */
@@ -97,8 +112,6 @@ void emit_target_to_file( FILE *file, target *tar ) {
  */
 void dep_mkdirs(char *dirpath, char *sandboxDir) {
 
-  fprintf(stderr, "DIRPATH: %s+\n", dirpath);
-  fprintf(stderr, "SANDBOX: %s+\n", sandboxDir);
   char *full_path = malloc(strlen(dirpath) + strlen(sandboxDir) + 100);
   strcpy(full_path, sandboxDir);
   strcat(full_path, dirpath);
@@ -111,10 +124,7 @@ void dep_mkdirs(char *dirpath, char *sandboxDir) {
     dep_mkdirs(dname, sandboxDir);
   }
   free(dirpath_cpy);
-  fprintf(stderr, "fullpath before making: %s+\n", full_path);
   int ret = mkdir(dirpath, 0777);
-  fprintf(stderr, "mkdir ret: %d\n", ret);
-  fprintf(stderr, "mkdir errno: %d\n", errno);
   free(full_path);
 }
 
@@ -179,8 +189,6 @@ void TARGET_copy_deps(target *tar, char *sandbox_pwd) {
     copy = copy->next;
   }
 }
-
-
 
 /*
  * linked list node struct to hold a process id and its associated filepath
@@ -358,14 +366,6 @@ const char *dependency_file_name = "dependency.txt";
 
 
 int main(int argc, char *argv) {
-  
-  //dep_mkdirs("/test/dir1/dir2/dir3", "/u/riker/u93/asehr/cs252/lab4-src/sandbox");
-  //dep_mkdirs("/test/dir1/dir2/dir4", "/u/riker/u93/asehr/cs252/lab4-src/sandbox");
-  //dep_mkdirs("/test/dir1/dir2/dir3", "/u/riker/u93/asehr/cs252/lab4-src/sandbox");
-
-
-
-
   // argv: "record-build" [targets]
   // execvp("/usr/bin/strace", ["/usr/bin/strace", "-f", "-o", "t.out", "make", [targets]);
   // arguments for execve
@@ -456,6 +456,25 @@ int main(int argc, char *argv) {
   strcat(sandbox_pwd, "sandbox");
   int status = mkdir(sandbox_pwd, 0777);
 
+  //create makefile inside the sandbox
+  char *sandbox_mkfile_path = strdup(sandbox_pwd);
+  strcat(sandbox_mkfile_path, "/Makefile");
+  FILE* sandbox_mkfile = fopen(sandbox_mkfile_path, "w");
+  if ( !sandbox_mkfile ) {
+    fprintf(stderr, "Sandbox makefile, \"%s\", could not be opened for writing!",
+              sandbox_mkfile_path);
+  }
+  else {
+    //write the wrapper for all targets to the makefile
+    //  all_make_targets is a special generated target that will have dependencies on all
+    //  other targets, and will be placed at the end, to allow the 'make' command to
+    //  build all of the targets based on building the 'all' target on the first line
+    fprintf(sandbox_mkfile, "\nall: all_make_targets\n");
+  }
+
+  //buffer to track all of the targets made by this build
+  char make_targets_list[BUFFER_SIZE];
+
   //read one line in and compare it with the target format
   while(!feof(in_file) && fgets(buffer, sizeof(buffer), in_file) != NULL ) {
     // discard any lines that return -1 ENOENT, as these are commands that failed
@@ -521,11 +540,16 @@ int main(int argc, char *argv) {
           //this is the start of a new target, need to output the old target to dependency file and
           // copy the dependencies to sandbox dir
           if ( cur_target != NULL ) {
-            fprintf(stderr, "EMITTING TARGET\n");
             emit_target_to_file(dep_file, cur_target);
-            //TODO: copy the previous target's dependency files to sandbox
-            // make a new directory
             TARGET_copy_deps(cur_target, sandbox_pwd);
+            emit_target_to_makefile(sandbox_mkfile, cur_target);
+            //add the target to the list of make targets
+            //TODO: add the target's name to the dependencies of all_make_targets
+            //TARGET_add_dep(make_list, strdup(cur_target->target_name));
+            //fprintf(stderr, "new make target\n");
+            //fprintf(stderr, "MAKE_TARGET: \"%s\"\n", cur_target->target_name);
+            strcat(make_targets_list, " ");
+            strcat(make_targets_list, cur_target->target_name);
           }
           int i;
           int cmd_index = 0;
@@ -609,11 +633,25 @@ int main(int argc, char *argv) {
   if ( cur_target != NULL ) {
     emit_target_to_file(dep_file, cur_target);
     TARGET_copy_deps(cur_target, sandbox_pwd);
+    emit_target_to_makefile(sandbox_mkfile, cur_target);
+    strcat(make_targets_list, " ");
+    strcat(make_targets_list, cur_target->target_name);
   }
+
+  //write the all_make_targets wrapper target at the end of the makefile
+  fprintf(sandbox_mkfile, "\nall_make_targets:%s", make_targets_list);
+
+  //print message detailing where to find sandbox directory
+  fprintf(stdout, "\nThe generated sandbox directory can be found at %s\n", sandbox_pwd);
+  fprintf(stdout, "In this directory, you may examine and modify the source files and their");
+  fprintf(stdout, " dependencies and rebuild the tool\n");
+  fprintf(stdout, "To build the sandboxed version of the tool, change directories to that");
+  fprintf(stdout, " directory, and use the following command:\n\n\tmake\n\n");
 
   //close opened files
   fclose(in_file);
   fclose(cmds_file);
   fclose(sources_file);
   fclose(dep_file);
+  fclose(sandbox_mkfile);
 } // end main
