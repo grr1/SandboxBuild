@@ -70,15 +70,31 @@ void TARGET_add_dep(target *tar, char *new_dep) {
  * Emits the information needed to build one target to the generated sandbox makefile
  * params:
  *    file: the file pointer to the generated makefile in the sandbox dir
+ *    sb_pwd: the filepath to the sandbox, used to insert -I flag in gcc cmds
  *    tar:  pointer to the target struct containing the information to be writen
  */
-void emit_target_to_makefile(FILE *file, target *tar) {
+void emit_target_to_makefile(FILE *file, char *sb_pwd, target *tar) {
   // first file is the local dependency
   // ex: target: target.cc
   fprintf(file, "\n%s: %s\n", tar->target_name, tar->head->dep);
   // write the command to execute for this target
   //TODO: need to change to track multiple commands
-  fprintf(file, "\t%s\n",tar->cmd); 
+  //TODO: write in "-I[path-to-sandbox] for gcc commands
+  //      to add sandbox directory to the linking path
+  char *gcc_index = strstr(tar->cmd, "gcc");
+  if ( !gcc_index ) {
+    //if it is not a gcc command, check for a g++ command
+    gcc_index = strstr(tar->cmd, "g++");
+  }
+  if ( gcc_index ) {
+    //write all chars up to and including "gcc " in the command
+    fprintf(file, "\t");
+    fwrite(tar->cmd, 1, gcc_index - tar->cmd + 4, file);
+    fprintf(file, "-I%s %s\n", sb_pwd, gcc_index + 4);
+  }
+  else {
+    fprintf(file, "\t%s\n",tar->cmd); 
+  }
 }
 
 /*
@@ -542,7 +558,7 @@ int main(int argc, char *argv) {
           if ( cur_target != NULL ) {
             emit_target_to_file(dep_file, cur_target);
             TARGET_copy_deps(cur_target, sandbox_pwd);
-            emit_target_to_makefile(sandbox_mkfile, cur_target);
+            emit_target_to_makefile(sandbox_mkfile, sandbox_pwd, cur_target);
             //add the target to the list of make targets
             //TODO: add the target's name to the dependencies of all_make_targets
             //TARGET_add_dep(make_list, strdup(cur_target->target_name));
@@ -633,7 +649,7 @@ int main(int argc, char *argv) {
   if ( cur_target != NULL ) {
     emit_target_to_file(dep_file, cur_target);
     TARGET_copy_deps(cur_target, sandbox_pwd);
-    emit_target_to_makefile(sandbox_mkfile, cur_target);
+    emit_target_to_makefile(sandbox_mkfile, sandbox_pwd, cur_target);
     strcat(make_targets_list, " ");
     strcat(make_targets_list, cur_target->target_name);
   }
