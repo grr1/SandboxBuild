@@ -20,6 +20,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#define REFACTOR 1
+
 
 // constant for large buffer lengths
 #define BUFFER_SIZE 512
@@ -378,7 +380,149 @@ const char *sources_file_name = "source_files.txt";
  * COMMAND: gcc -o ...
  * DEPENDENCY: dep1.c dep2.h dep3.cc ....
  */
+
+
+//GLOBALS
 const char *dependency_file_name = "dependency.txt";
+FILE *dep_file = NULL;
+FILE *cmds_file = NULL;
+char *sandbox_pwd = NULL;
+FILE* sandbox_mkfile = NULL;
+//buffer to track all of the targets made by this build
+char make_targets_list[BUFFER_SIZE];
+
+
+#if REFACTOR
+FILE *sources_file = NULL;
+
+
+
+target *cur_target = NULL;
+// linked list to hold the filepaths of desired commands
+//list *fps_list = malloc(sizeof(list));
+list *fps_list = NULL;
+
+
+/*
+ *
+ */
+void handleOpenat(char *pwd, char *argStr, int pid) {
+  
+}
+
+/*
+ *
+ */
+void handleWrite(char *pwd, char *argStr, int pid) {
+  
+}
+
+/*
+ *
+ */
+void handleExec(char *pwd, char *argStr, int pid) {
+  //fprintf(stderr, "PWD: %s\nargStr: %s\npid: %d\n", pwd, argStr, pid);
+  int command_end_index = strchr(argStr, '\"') - argStr;
+  //the index of the " at the end of the filepath to the executed command
+
+  int command_start_index = 0; //the index of the first letter in the name of the command to be run
+  for ( int i = command_end_index - 1; i >= 0; i-- ) {
+    if ( argStr[i] == '/' ) {
+      command_start_index = i + 1;
+      break;
+    }
+  }
+
+  int cmd_len = command_end_index - command_start_index;
+  //TODO: strndup for next 2 lines
+  char *cmd_name = malloc(cmd_len + 1);
+  strncpy(cmd_name, argStr + command_start_index, cmd_len);
+
+  if ( !strcmp(cmd_name, "gcc") || !strcmp(cmd_name, "g++") ) {
+    //gnu comp cmd
+    //handle_gnu_comp(
+      if ( is_desired_cmd(cmd_name) == true) {
+        if ( !strcmp(cmd_name, "gcc") || !strcmp(cmd_name, "g++") ) {
+          LIST_add(fps_list, pid, cmd_name);
+        }
+        //parse the line and add appropriate entries in list of source files and list of commands
+        char *source = extract_sources(argStr);
+        if ( source != NULL ) {
+          fprintf(sources_file, "%s/%s\n", pwd, source);
+        }
+        // the arguments passed to the executable run by execve are formated as such:
+        //   ["arg1", "arg2", ..."argn"]
+        int lbracket_index = -1;
+        int rbracket_index = -1;
+        for ( int i = 0; i < strlen(argStr); i++ ) {
+          if ( argStr[i] == ']' ) {
+            rbracket_index = i;
+            break;
+          }
+          else if ( lbracket_index == -1 && argStr[i] == '[' ) {
+            lbracket_index = i;
+          }
+        }
+        char cmd_buffer[BUFFER_SIZE];
+        if ( !strcmp(cmd_name, "gcc") || !strcmp(cmd_name, "g++") ) {
+          //this is the start of a new target, need to output the old target to dependency file and
+          // copy the dependencies to sandbox dir
+          if ( cur_target != NULL ) {
+            emit_target_to_file(dep_file, cur_target);
+            TARGET_copy_deps(cur_target, sandbox_pwd);
+            emit_target_to_makefile(sandbox_mkfile, sandbox_pwd, cur_target);
+            //add the target to the list of make targets
+            //TODO: add the target's name to the dependencies of all_make_targets
+            //TARGET_add_dep(make_list, strdup(cur_target->target_name));
+            //fprintf(stderr, "new make target\n");
+            //fprintf(stderr, "MAKE_TARGET: \"%s\"\n", cur_target->target_name);
+            strcat(make_targets_list, " ");
+            strcat(make_targets_list, cur_target->target_name);
+          }
+          int i;
+          int cmd_index = 0;
+          for ( i = lbracket_index + 1; i < rbracket_index; i++ ) {
+            cmd_buffer[i] = argStr[i];
+            if ( argStr[i] != '\"' && argStr[i] != ',' ) {
+              if ( argStr[i] != '\0' ) {
+                fputc(argStr[i], cmds_file);
+                cmd_buffer[cmd_index] = argStr[i];
+                cmd_index++;
+              }
+            }
+          }
+          //TODO: free cur target's members here
+          cur_target = malloc(sizeof(target));
+          //parse the target file from the command
+          cmd_buffer[i] = '\0';
+          char *target_file = parse_target_from_cmd(cmd_buffer);
+          cmd_buffer[cmd_index] = '\0'; //null terminate the command buffer
+          cur_target->target_name = strndup(target_file, strlen(target_file));
+          cur_target->cmd = strndup(cmd_buffer, strlen(cmd_buffer));
+
+          // write newline in the commands file
+          fputc('\n', cmds_file);
+          if ( LIST_find_pid(fps_list, pid)  != NULL ) {
+            TARGET_add_dep(cur_target, source);
+          }
+        } // end if ( gcc/g++ cmd match)
+        else {
+          //TODO: check if the cmd is as or ld
+        }
+      }
+  }
+
+}
+
+/*
+ *
+ */
+void handleChdir(char *pwd, char *argStr, int pid) {
+  
+}
+
+#endif
+
 
 
 int main(int argc, char *argv) {
@@ -412,7 +556,7 @@ int main(int argc, char *argv) {
   }
 
   //open file to write list of commands to
-  FILE *cmds_file = fopen(cmds_file_name, "w");
+  cmds_file = fopen(cmds_file_name, "w");
   if (cmds_file == NULL ) {
     //check for fopen failure
     fprintf(stderr, "ERROR: file to write list of commands to,  %s, could not be opened!\n",cmds_file_name);
@@ -432,7 +576,7 @@ int main(int argc, char *argv) {
     exit(1);
   }
 
-  FILE *dep_file = fopen(dependency_file_name, "w");
+  dep_file = fopen(dependency_file_name, "w");
   if ( dep_file == NULL ) {
     //check for open failure
     fprintf(stderr, "ERROR: file to write dependencies to, %s, could not be opened\n", dependency_file_name);
@@ -475,7 +619,7 @@ int main(int argc, char *argv) {
   //create makefile inside the sandbox
   char *sandbox_mkfile_path = strdup(sandbox_pwd);
   strcat(sandbox_mkfile_path, "/Makefile");
-  FILE* sandbox_mkfile = fopen(sandbox_mkfile_path, "w");
+  sandbox_mkfile = fopen(sandbox_mkfile_path, "w");
   if ( !sandbox_mkfile ) {
     fprintf(stderr, "Sandbox makefile, \"%s\", could not be opened for writing!",
               sandbox_mkfile_path);
@@ -488,8 +632,56 @@ int main(int argc, char *argv) {
     fprintf(sandbox_mkfile, "\nall: all_make_targets\n");
   }
 
-  //buffer to track all of the targets made by this build
-  char make_targets_list[BUFFER_SIZE];
+
+#if REFACTOR
+  //TODO: FOR REFACTORING
+
+  fps_list = malloc(sizeof(list));
+  char *syscall = malloc(32); // buffer to hold the used syscall
+  char *argStr = malloc(BUFFER_SIZE); // buffer for the args passed to the syscall
+  int rval = -1; //the return value of the syscall
+  while(!feof(in_file) && fgets(buffer, sizeof(buffer), in_file) != NULL ) {
+    //TODO: discard syscalls the return other errors
+    // discard lines that return ENOENT and resumed lines
+    if ( strstr(buffer, "ENOENT") != NULL || strstr(buffer, "resumed>") != NULL ) {
+      continue;
+    }
+    /* */
+    int scanret = sscanf(buffer, "%d %[^(](%[^)]) = %d", &pid, syscall, argStr, &rval);
+    //fprintf(stderr, "BUFFER %s; scanret %d; pid %d; syscall %s; argStr %s; rval %d\n", buffer, scanret, pid, syscall, argStr, rval);
+
+    if ( scanret == 4 || sscanf(buffer, "%d %[^(](%[^<]<unfinished ...>", &pid, syscall, argStr) == 3 ) {
+      //normally formatted line, parse the systall
+      if ( !strcmp(syscall, "openat")) {
+        handleOpenat(pwd, argStr, pid);
+      }
+      else if ( !strcmp(syscall, "write")) {
+        handleWrite(pwd, argStr, pid);
+      }
+      else if ( !strcmp(syscall, "execve")) {
+        handleExec(pwd, argStr, pid);
+      }
+      else if ( !strcmp(syscall, "chdir")) {
+        handleChdir(pwd, argStr, pid);
+      }
+      else if ( !strcmp(syscall, "vfork")) {
+        handleChdir(pwd, argStr, pid);
+      }
+    }
+    else {
+      //abornmally formatted line, print it for now
+      if ( !strstr(buffer, "resumed") ) {
+        fprintf(stderr, "%s+\n", buffer);
+      }
+    }
+  }
+
+
+  return;
+  //TODO: END REFACTORIN
+
+#else
+  // BEGIN ORIGINAL
 
   //read one line in and compare it with the target format
   while(!feof(in_file) && fgets(buffer, sizeof(buffer), in_file) != NULL ) {
@@ -670,4 +862,6 @@ int main(int argc, char *argv) {
   fclose(sources_file);
   fclose(dep_file);
   fclose(sandbox_mkfile);
+#endif
+  // END ORIGINAL
 } // end main
