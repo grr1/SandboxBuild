@@ -20,11 +20,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define REFACTOR 1
+#define REFACTOR 0
 
 
 // constant for large buffer lengths
-#define BUFFER_SIZE 512
+#define BUFFER_SIZE 2000000
 
 /*
  * Linked list node struct for dependency files for one target
@@ -42,6 +42,7 @@ typedef struct targetstruct {
   char *cmd;
   depnode *head;
   depnode *tail;
+  bool usedInter;
 } target;
 
 /*
@@ -81,7 +82,6 @@ void emit_target_to_makefile(FILE *file, char *sb_pwd, target *tar) {
   fprintf(file, "\n%s: %s\n", tar->target_name, tar->head->dep);
   // write the command to execute for this target
   //TODO: need to change to track multiple commands
-  //TODO: write in "-I[path-to-sandbox] for gcc commands
   //      to add sandbox directory to the linking path
   char *gcc_index = strstr(tar->cmd, "gcc");
   if ( !gcc_index ) {
@@ -277,8 +277,8 @@ void LIST_add(list *fp_list,int pid, char *filepath) {
  */
 char * parse_target_from_cmd(char *cmd) {
   //create a copy to not put null terminator in the original command argument
-  char *target = strstr(cmd, "-o ");
-  char *target_copy = strdup(target) + 3; // cut off "-o "
+  char *target_name = strstr(cmd, "-o ");
+  char *target_copy = strdup(target_name) + 3; // cut off "-o "
   int index = 0;
   while ( target_copy[index] != ' ' ) {
     index++;
@@ -292,7 +292,8 @@ char * parse_target_from_cmd(char *cmd) {
  */
 bool is_desired_cmd(char *cmd) {
   return !strcmp(cmd, "gcc") || !strcmp(cmd, "g++") ||
-         !strcmp(cmd, "as" )  || !strcmp(cmd, "ld") ;
+         !strcmp(cmd, "as" )  || !strcmp(cmd, "ld") ||
+         !strcmp(cmd, "sh" );
 }
 
 /*
@@ -390,38 +391,64 @@ char *sandbox_pwd = NULL;
 FILE* sandbox_mkfile = NULL;
 //buffer to track all of the targets made by this build
 char make_targets_list[BUFFER_SIZE];
+char *cmd_buffer = NULL;
+list *fps_list = NULL;
 
 
-#if REFACTOR
 FILE *sources_file = NULL;
-
-
-
 target *cur_target = NULL;
 // linked list to hold the filepaths of desired commands
-//list *fps_list = malloc(sizeof(list));
-list *fps_list = NULL;
+
+#if REFACTOR
 
 
 /*
  *
  */
 void handleOpenat(char *pwd, char *argStr, int pid) {
-  
+  char *openat = strstr(argStr, "openat(");
+    //discard openat calls that return ENOENT, open failed
+    if ( openat != NULL && strstr(openat, "ENOENT") == NULL &&
+          ( LIST_find_pid(fps_list, pid) != NULL || strstr(openat, ".h") != NULL) ) {
+
+    //ignore locale files being opened
+       if ( strstr(openat, "locale") == NULL && strstr(openat, "/etc/") == NULL &&
+            strstr(openat, "/types/") == NULL && strstr(openat, ".cache") == NULL &&
+            strstr(openat, "/bits/") == NULL  && strstr(openat, "/tmp/") == NULL) {
+         openat += 18; // cut off "openat(AT_FDCWD, \""
+         for ( int i = 0; i < strlen(openat); i++ ) {
+           if ( openat[i] == '\"' ) {
+             openat[i] = '\0';
+             break;
+           }
+         }
+         TARGET_add_dep(cur_target, openat);
+       }
+     }
 }
+
 
 /*
  *
  */
-void handleWrite(char *pwd, char *argStr, int pid) {
-  
+char *handleChdir(char *pwd, char *argStr, int pid) {
+  char *new_cwd = strstr(argStr, "chdir(");
+    if ( new_cwd != NULL ) { // syscall executed on this line was chdir, need to change cwd
+      pwd = new_cwd + 7; // cut off \"chdir("\" from the beginning of new_cwd
+      for ( int i = 0; i < strlen(pwd); i++ ) {
+        if ( pwd[i] == '\"' ) {
+          pwd[i] = '\0'; // null terminate the pathfile for the new working directory
+          break;
+        }
+      }
+    }
+    return pwd;
 }
 
 /*
  *
  */
 void handleExec(char *pwd, char *argStr, int pid) {
-  //fprintf(stderr, "PWD: %s\nargStr: %s\npid: %d\n", pwd, argStr, pid);
   int command_end_index = strchr(argStr, '\"') - argStr;
   //the index of the " at the end of the filepath to the executed command
 
@@ -435,35 +462,35 @@ void handleExec(char *pwd, char *argStr, int pid) {
 
   int cmd_len = command_end_index - command_start_index;
   //TODO: strndup for next 2 lines
-  char *cmd_name = malloc(cmd_len + 1);
-  strncpy(cmd_name, argStr + command_start_index, cmd_len);
+  char *cmd_name = strndup(argStr + command_start_index, cmd_len);
 
-  if ( !strcmp(cmd_name, "gcc") || !strcmp(cmd_name, "g++") ) {
     //gnu comp cmd
     //handle_gnu_comp(
       if ( is_desired_cmd(cmd_name) == true) {
         if ( !strcmp(cmd_name, "gcc") || !strcmp(cmd_name, "g++") ) {
           LIST_add(fps_list, pid, cmd_name);
         }
+        else if ( !strcmp(cmd_name, "sh") ) {
+          fprintf(stderr, "/usr/bin/sh found!\n");
+        }
         //parse the line and add appropriate entries in list of source files and list of commands
         char *source = extract_sources(argStr);
         if ( source != NULL ) {
           fprintf(sources_file, "%s/%s\n", pwd, source);
         }
+        int lbracket = strchr(argStr, '[') - argStr;
+        int rbracket = strchr(argStr + lbracket, ']') - argStr;
         // the arguments passed to the executable run by execve are formated as such:
         //   ["arg1", "arg2", ..."argn"]
-        int lbracket_index = -1;
-        int rbracket_index = -1;
-        for ( int i = 0; i < strlen(argStr); i++ ) {
-          if ( argStr[i] == ']' ) {
-            rbracket_index = i;
-            break;
+        //char cmd_buffer[BUFFER_SIZE];
+          if ( cur_target != NULL ) {
+            emit_target_to_file(dep_file, cur_target);
+            TARGET_copy_deps(cur_target, sandbox_pwd);
+            emit_target_to_makefile(sandbox_mkfile, sandbox_pwd, cur_target);
+            strcat(make_targets_list, " ");
+            strcat(make_targets_list, cur_target->target_name);
           }
-          else if ( lbracket_index == -1 && argStr[i] == '[' ) {
-            lbracket_index = i;
-          }
-        }
-        char cmd_buffer[BUFFER_SIZE];
+        cmd_buffer = malloc(BUFFER_SIZE);
         if ( !strcmp(cmd_name, "gcc") || !strcmp(cmd_name, "g++") ) {
           //this is the start of a new target, need to output the old target to dependency file and
           // copy the dependencies to sandbox dir
@@ -481,7 +508,7 @@ void handleExec(char *pwd, char *argStr, int pid) {
           }
           int i;
           int cmd_index = 0;
-          for ( i = lbracket_index + 1; i < rbracket_index; i++ ) {
+          for ( i = lbracket + 1; i < rbracket; i++ ) {
             cmd_buffer[i] = argStr[i];
             if ( argStr[i] != '\"' && argStr[i] != ',' ) {
               if ( argStr[i] != '\0' ) {
@@ -499,6 +526,12 @@ void handleExec(char *pwd, char *argStr, int pid) {
           cmd_buffer[cmd_index] = '\0'; //null terminate the command buffer
           cur_target->target_name = strndup(target_file, strlen(target_file));
           cur_target->cmd = strndup(cmd_buffer, strlen(cmd_buffer));
+          if ( strstr(buffer, " -c ") != NULL ) {
+            cur_target->isInter = true;
+          }
+          else {
+            cur_target->isInter = false;
+          }
 
           // write newline in the commands file
           fputc('\n', cmds_file);
@@ -510,49 +543,70 @@ void handleExec(char *pwd, char *argStr, int pid) {
           //TODO: check if the cmd is as or ld
         }
       }
-  }
-
 }
 
-/*
- *
- */
-void handleChdir(char *pwd, char *argStr, int pid) {
-  
-}
 
 #endif
 
 
 
-int main(int argc, char *argv) {
-  // argv: "record-build" [targets]
-  // execvp("/usr/bin/strace", ["/usr/bin/strace", "-f", "-o", "t.out", "make", [targets]);
-  // arguments for execve
-  char *exec_args[argc + 4];
-  exec_args[0] = "/usr/bin/strace";
-  exec_args[1] = "-f";
-  exec_args[2] = "-o";
-  exec_args[3] = "t.out";
-  exec_args[4] = "make";
-  for ( int i = 1; i < argc; i++ ) {
-    exec_args[i + 4] = &(argv[i]);
+int main(int argc, char *argv[]) {
+  FILE *in_file = NULL;
+  if ( argc >= 2 && !strcmp(argv[1], "-s") ) {
+    if ( argc != 3 ) {
+      fprintf(stderr, "\nUSAGE: record_build -s [strace log input file]\n\n");
+      exit(1);
+    }
+    else {
+      char *cwd = malloc(BUFFER_SIZE);
+      getcwd(cwd, BUFFER_SIZE);
+      strcat(cwd, "/");
+      strcat(cwd, argv[2]);
+      in_file = fopen(cwd, "r");
+      if ( !in_file ) {
+        fprintf(stderr, "\nERROR: strace input file, \"%s\", could not be opened!\n", cwd);
+        free(cwd);
+        exit(1);
+      }
+      free(cwd);
+    }
   }
+  else {
+    // argv: "record-build" [targets]
+    // execvp("/usr/bin/strace", ["/usr/bin/strace", "-f", "-o", "t.out", "make", [targets]);
+    // arguments for execve
+    char *exec_args[argc + 10];
+    exec_args[0] = strdup("/usr/bin/strace");
+    exec_args[1] = strdup("-f");
+    exec_args[2] = strdup("--no-abbrev");
+    exec_args[3] = strdup("-s");
+    exec_args[4] = strdup("2000000");
+    exec_args[5] = strdup("-o");
+    exec_args[6] = strdup("t.out");
+    exec_args[7] = strdup("make");
+    int i;
+    for (i = 1; i < argc; i++ ) {
+      exec_args[i + 7] = argv[i];
+    }
+    exec_args[i+7] = NULL;
 
-  // fork a child process to execute strace in
-  int ret = fork();
-  if ( ret == 0 ) {
-    execvp(exec_args[0], exec_args);
-  }
-  // wait for the forked process to complete
-  waitpid(ret, NULL, 0);
+    // fork a child process to execute strace in
+    int ret = fork();
+    if ( ret == 0 ) {
+      execvp(exec_args[0], exec_args);
+      perror("execvp");
+      fprintf(stderr, "ERROR: exec did not overwrite text section\n");
+      exit(1);
+    }
+    // wait for the forked process to complete
+    waitpid(ret, NULL, 0);//open input file for writing
+    in_file = fopen(input_file_name, "r");
+    if (in_file == NULL ) {
+      //check for fopen failure
+      fprintf(stderr, "ERROR: input file to be parsed,  %s, could not be opened!\n", input_file_name);
+      exit(1);
+    }
 
-  //open input file for writing
-  FILE *in_file = fopen(input_file_name, "r");
-  if (in_file == NULL ) {
-    //check for fopen failure
-    fprintf(stderr, "ERROR: input file to be parsed,  %s, could not be opened!\n", input_file_name);
-    exit(1);
   }
 
   //open file to write list of commands to
@@ -566,7 +620,7 @@ int main(int argc, char *argv) {
   }
 
   //open file to write list of source files to
-  FILE *sources_file = fopen(sources_file_name, "w");
+  sources_file = fopen(sources_file_name, "w");
   if (sources_file == NULL ) {
     //check for fopen failure
     fprintf(stderr, "ERROR: file to write source file names to,  %s, could not be opened!\n", sources_file_name);
@@ -582,7 +636,7 @@ int main(int argc, char *argv) {
     fprintf(stderr, "ERROR: file to write dependencies to, %s, could not be opened\n", dependency_file_name);
   }
 
-  char buffer[BUFFER_SIZE]; //buffer to hold a line in
+  char bufferIn[BUFFER_SIZE]; //buffer to hold a line in
   char args[BUFFER_SIZE]; //buffer to hold the arguments of an execve call in
   int pid = -1; //the pid of the system call on the current line
   bool vfork = false; // was the previous line a vfork call?
@@ -590,7 +644,8 @@ int main(int argc, char *argv) {
   int saved_pid = -1;
 
   // linked list to hold the filepaths of desired commands
-  list *fps_list = malloc(sizeof(list));
+  //list *fps_list = malloc(sizeof(list));
+  fps_list = malloc(sizeof(list));
 
   // get the current working directory, to list absolute filepaths in
   char *pwd = malloc(BUFFER_SIZE);
@@ -607,10 +662,10 @@ int main(int argc, char *argv) {
 
   // the current target struct node ptr
   // used to remove repeated dependencies, and for copying into sandbox
-  target *cur_target = NULL;
+  cur_target = NULL;
 
   // create a new directory for the sandbox dependencies to be copied into
-  char *sandbox_pwd = malloc(strlen(pwd) + 9);
+  sandbox_pwd = malloc(strlen(pwd) + 9);
   strcpy(sandbox_pwd, pwd);
   strcat(sandbox_pwd, "/");
   strcat(sandbox_pwd, "sandbox");
@@ -646,46 +701,63 @@ int main(int argc, char *argv) {
     if ( strstr(buffer, "ENOENT") != NULL || strstr(buffer, "resumed>") != NULL ) {
       continue;
     }
-    /* */
     int scanret = sscanf(buffer, "%d %[^(](%[^)]) = %d", &pid, syscall, argStr, &rval);
-    //fprintf(stderr, "BUFFER %s; scanret %d; pid %d; syscall %s; argStr %s; rval %d\n", buffer, scanret, pid, syscall, argStr, rval);
 
     if ( scanret == 4 || sscanf(buffer, "%d %[^(](%[^<]<unfinished ...>", &pid, syscall, argStr) == 3 ) {
+      // if previous line was a vfork, save the current pid and use it instead of the newly read in one
+      if ( vfork ) {
+        pid = saved_pid;
+      }
+      else {
+        saved_pid = pid;
+      }
       //normally formatted line, parse the systall
       if ( !strcmp(syscall, "openat")) {
         handleOpenat(pwd, argStr, pid);
       }
-      else if ( !strcmp(syscall, "write")) {
-        handleWrite(pwd, argStr, pid);
-      }
       else if ( !strcmp(syscall, "execve")) {
+        //remove the quote from the start of argStr
+        argStr++;
         handleExec(pwd, argStr, pid);
       }
       else if ( !strcmp(syscall, "chdir")) {
-        handleChdir(pwd, argStr, pid);
+        pwd = handleChdir(pwd, argStr, pid);
       }
       else if ( !strcmp(syscall, "vfork")) {
-        handleChdir(pwd, argStr, pid);
+        if ( strstr(buffer, "vfork(") != NULL && strstr(buffer, "unfinished") != NULL ) {
+          vfork = true;
+        }
       }
     }
     else {
-      //abornmally formatted line, print it for now
-      if ( !strstr(buffer, "resumed") ) {
-        fprintf(stderr, "%s+\n", buffer);
+      //abnormally formatted line
+      // check for vfork resumed
+      if ( strstr(buffer, "vfork resumed") != NULL ) {
+          vfork = false;
       }
     }
   }
 
+  if ( cur_target != NULL ) {
+    emit_target_to_file(dep_file, cur_target);
+    TARGET_copy_deps(cur_target, sandbox_pwd);
+    emit_target_to_makefile(sandbox_mkfile, sandbox_pwd, cur_target);
+    strcat(make_targets_list, " ");
+    strcat(make_targets_list, cur_target->target_name);
+  }
 
+  fprintf(stderr, "end\n");
   return;
-  //TODO: END REFACTORIN
+  //END REFACTORING
 
 #else
   // BEGIN ORIGINAL
+  
 
   //read one line in and compare it with the target format
-  while(!feof(in_file) && fgets(buffer, sizeof(buffer), in_file) != NULL ) {
+  while(!feof(in_file) && fgets(bufferIn, sizeof(bufferIn), in_file) != NULL ) {
     // discard any lines that return -1 ENOENT, as these are commands that failed
+    char *buffer = strdup(bufferIn);
     if ( sscanf(buffer, "%d execve(\"%[^\n]\n", &pid, args) == 2  && strstr(args, "ENOENT") == NULL) {
       // current line matches the desired format, check whether the command is one of
       //  the desired commands: gcc, g++, ld, as
@@ -724,6 +796,10 @@ int main(int argc, char *argv) {
       if ( is_desired_cmd(cmd_name) == true) {
         if ( !strcmp(cmd_name, "gcc") || !strcmp(cmd_name, "g++") ) {
           LIST_add(fps_list, pid, cmd_name);
+        }
+        else if ( !strcmp(cmd_name, "sh") ) {
+          //TODO: executed /usr/bin/sh, how do i handle this?
+          fprintf(stderr, "/bin/sh executed!\n");
         }
         //parse the line and add appropriate entries in list of source files and list of commands
         char *source = extract_sources(args);
@@ -837,6 +913,7 @@ int main(int argc, char *argv) {
     } // end else (sscanf match);
   } // end while
 
+#endif
   //emit the last target
   if ( cur_target != NULL ) {
     emit_target_to_file(dep_file, cur_target);
@@ -862,6 +939,5 @@ int main(int argc, char *argv) {
   fclose(sources_file);
   fclose(dep_file);
   fclose(sandbox_mkfile);
-#endif
   // END ORIGINAL
 } // end main
