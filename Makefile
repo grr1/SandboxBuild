@@ -1,5 +1,5 @@
 
-all: record_build 
+all: record_build
 
 record_build: record_build.c
 	gcc -g -o record_build record_build.c

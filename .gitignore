@@ -1,0 +1,9 @@
+SandboxBuild
+copy
+copy.c
+dash
+dash2
+*.swp
+record-build.sh
+record_build
+hello_world
