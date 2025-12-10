@@ -5,8 +5,6 @@
  * This parser looks for lines in which the following conditions are met:
     1: the system call performed is "execve"
     2: the ending of the executable is "gcc", "g++", "ld", or "as"
- * These such lines 
-
  */
 
 #include <errno.h>
@@ -19,8 +17,6 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-#define REFACTOR 0
 
 
 // constant for large buffer lengths
@@ -69,6 +65,25 @@ void TARGET_add_dep(target *tar, char *new_dep) {
   }
 }
 
+char *replace_extension(char *file, char *new_ext) {
+  char *new = malloc(strlen(file) + 4); //include space for .bc and .ll files when from .c
+  strcpy(new, file);
+  //find start of file extension
+  char *ext = strchr(new, '.');
+  if ( ext == NULL ) {
+    ext = new + strlen(new);
+  }
+  //fprintf(stderr, "NEWEXT: %s\n", ext);
+  int i = 0;
+  //replace file extension, starting with the .
+  for ( ; i < strlen(new_ext); i++ ) {
+    ext[i] = new_ext[i];
+  }
+  //null terminate new file
+  ext[i] = '\0';
+  return new;
+}
+
 /*
  * Emits the information needed to build one target to the generated sandbox makefile
  * params:
@@ -76,26 +91,134 @@ void TARGET_add_dep(target *tar, char *new_dep) {
  *    sb_pwd: the filepath to the sandbox, used to insert -I flag in gcc cmds
  *    tar:  pointer to the target struct containing the information to be writen
  */
-void emit_target_to_makefile(FILE *file, char *sb_pwd, target *tar) {
+void emit_target_to_makefile(FILE *file, char *sb_pwd, target *tar, bool isClang) {
   // first file is the local dependency
   // ex: target: target.cc
-  fprintf(file, "\n%s: %s\n", tar->target_name, tar->head->dep);
-  // write the command to execute for this target
-  //TODO: need to change to track multiple commands
-  //      to add sandbox directory to the linking path
-  char *gcc_index = strstr(tar->cmd, "gcc");
-  if ( !gcc_index ) {
-    //if it is not a gcc command, check for a g++ command
-    gcc_index = strstr(tar->cmd, "g++");
+  if ( !isClang ) {
+    fprintf(file, "\n%s: %s\n", tar->target_name, tar->head->dep);
+    // write the command to execute for this target
+    char *gcc_index = strstr(tar->cmd, "gcc");
+    if ( !gcc_index ) {
+      //if it is not a gcc command, check for a g++ command
+      gcc_index = strstr(tar->cmd, "g++");
+    }
+    if ( gcc_index ) {
+      //write all chars up to and including "gcc " in the command
+      fprintf(file, "\t");
+      fwrite(tar->cmd, 1, gcc_index - tar->cmd + 4, file);
+      fprintf(file, "-I%s %s\n", sb_pwd, gcc_index + 4);
+    }
+    else {
+      fprintf(file, "\t%s\n",tar->cmd); 
+    }
   }
-  if ( gcc_index ) {
-    //write all chars up to and including "gcc " in the command
-    fprintf(file, "\t");
-    fwrite(tar->cmd, 1, gcc_index - tar->cmd + 4, file);
-    fprintf(file, "-I%s %s\n", sb_pwd, gcc_index + 4);
-  }
-  else {
-    fprintf(file, "\t%s\n",tar->cmd); 
+  else {  //emit using clang formatting
+
+    //write comment to file denoting original command
+    char *gcc_index = strstr(tar->cmd, "gcc");
+    
+    //use clang for gcc, clang++ for g++
+    char *CC = "clang";
+    if ( !gcc_index ) {
+      //if it is not a gcc command, check for a g++ command
+      gcc_index = strstr(tar->cmd, "g++");
+      CC = "clang++";
+    }
+    if ( gcc_index ) {
+      //write all chars up to and including "gcc " in the command
+      fprintf(file, "\n#");
+      fwrite(tar->cmd, 1, gcc_index - tar->cmd + 4, file);
+      fprintf(file, "-I%s %s\n", sb_pwd, gcc_index + 4);
+    }
+
+    // use clang formatting
+    char *tar_name = tar->target_name;
+    char *first = tar->head->dep;
+    int start = -1;
+    int end = -1;
+    if ( strstr(first, ".c") != NULL ) {
+      start = 1;
+    }
+    else if ( strstr(first, ".i") != NULL ) {
+      start = 2;
+    }
+    else if ( strstr(first, ".ll") != NULL ) {
+      start = 3;
+    }
+    else if ( strstr(first, ".bc") != NULL ) {
+      start = 4;
+    }
+    else if ( strstr(first, ".s") != NULL ) {
+      start = 5;
+    }
+    else if ( strstr(first, ".o") != NULL ) {
+      start = 6;
+    }
+    if ( strstr(tar_name, ".c") != NULL ) {
+      end = 1;
+    }
+    else if ( strstr(tar_name, ".i") != NULL ) {
+      end = 2;
+    }
+    else if ( strstr(tar_name, ".ll") != NULL ) {
+      end = 3;
+    }
+    else if ( strstr(tar_name, ".bc") != NULL ) {
+      end = 4;
+    }
+    else if ( strstr(tar_name, ".s") != NULL ) {
+      end = 5;
+    }
+    else if ( strstr(tar_name, ".o") != NULL ) {
+      end = 6;
+    }
+    else {
+      end = 7;
+    }
+    //temporary target file and dependency file
+    char *tempdep = strdup(first);
+    char *temptar = strdup(tar_name);
+    //c to i if necessary
+    if ( start == 1 && end > 1 ) {
+      temptar = replace_extension(temptar, ".i");
+      fprintf(file, "%s: %s\n", temptar, tempdep);
+      fprintf(file, "\t%s -I%s -E %s -o %s\n", CC, sb_pwd, tempdep, temptar);
+    }
+    //i to ll if necessary
+    if ( start <= 2 && end > 2 ) {
+      tempdep = replace_extension(tempdep, ".i");
+      temptar = replace_extension(temptar, ".ll");
+      fprintf(file, "\n%s: %s\n", temptar, tempdep);
+      fprintf(file, "\t%s -S -emit-llvm %s -o %s\n", CC, tempdep, temptar);
+    }
+    //ll to bc if necessary
+    if ( start <= 3&& end > 3 ) {
+      tempdep = replace_extension(tempdep, ".ll");
+      temptar = replace_extension(temptar, ".bc");
+      fprintf(file, "\n%s: %s\n", temptar, tempdep);
+      fprintf(file, "\t%s -c -emit-llvm %s -o %s\n", CC, tempdep, temptar);
+    }
+    //bc to s if necessary
+    if ( start <= 4 && end > 4 ) {
+      tempdep = replace_extension(tempdep, ".bc");
+      temptar = replace_extension(temptar, ".s");
+      fprintf(file, "\n%s: %s\n", temptar, tempdep);
+      fprintf(file, "\t%s -S  %s -o %s\n", CC, tempdep, temptar);
+    }
+    //s to o if necessary
+    if ( start <= 5 && end > 5 ) {
+      tempdep = replace_extension(tempdep, ".s");
+      temptar = replace_extension(temptar, ".o");
+      fprintf(file, "\n%s: %s\n", temptar, tempdep);
+      fprintf(file, "\t%s -c %s -o %s\n", CC, tempdep, temptar);
+    }
+    //o to executable if necessary
+    if ( start <= 5 && end > 5 ) {
+      tempdep = replace_extension(tempdep, ".o");
+      temptar = strdup(tar_name);
+      fprintf(file, "\n%s: %s\n", temptar, tempdep);
+      fprintf(file, "\t%s %s -o %s\n", CC, tempdep, temptar);
+    }
   }
 }
 
@@ -284,7 +407,7 @@ char * parse_target_from_cmd(char *cmd) {
   if ( target_name != NULL ) {
     target_copy = strdup(target_name) + 3; // cut off "-o "
     int index = 0;
-    while ( target_copy[index] != ' ' ) {
+    while ( target_copy[index] != ' ' && target_copy[index] != '\"' && target_copy[index] != ',' ) {
       index++;
     }
     target_copy[index] = '\0';
@@ -420,6 +543,8 @@ target *cur_target = NULL;
 
 
 int main(int argc, char *argv[]) {
+  //TODO: change to accept command line arg
+  bool isClang = true;
   FILE *in_file = NULL;
   if ( argc >= 2 && !strcmp(argv[1], "-s") ) {
     if ( argc != 3 ) {
@@ -631,7 +756,7 @@ int main(int argc, char *argv[]) {
           if ( cur_target != NULL ) {
             emit_target_to_file(dep_file, cur_target);
             TARGET_copy_deps(cur_target, sandbox_pwd);
-            emit_target_to_makefile(sandbox_mkfile, sandbox_pwd, cur_target);
+            emit_target_to_makefile(sandbox_mkfile, sandbox_pwd, cur_target, isClang);
             //add the target to the list of make targets
             //TODO: add the target's name to the dependencies of all_make_targets
             //TARGET_add_dep(make_list, strdup(cur_target->target_name));
@@ -722,13 +847,20 @@ int main(int argc, char *argv[]) {
   if ( cur_target != NULL ) {
     emit_target_to_file(dep_file, cur_target);
     TARGET_copy_deps(cur_target, sandbox_pwd);
-    emit_target_to_makefile(sandbox_mkfile, sandbox_pwd, cur_target);
+    emit_target_to_makefile(sandbox_mkfile, sandbox_pwd, cur_target, isClang);
     strcat(make_targets_list, " ");
     strcat(make_targets_list, cur_target->target_name);
   }
 
   //write the all_make_targets wrapper target at the end of the makefile
   fprintf(sandbox_mkfile, "\nall_make_targets:%s", make_targets_list);
+  fprintf(sandbox_mkfile, "\n\nclean:\n");
+  fprintf(sandbox_mkfile, "\trm *.i\n");
+  fprintf(sandbox_mkfile, "\trm *.ll\n");
+  fprintf(sandbox_mkfile, "\trm *.bc\n");
+  fprintf(sandbox_mkfile, "\trm *.s\n");
+  fprintf(sandbox_mkfile, "\trm *.o\n");
+  fprintf(sandbox_mkfile, "\trm%s\n", make_targets_list);
 
   //print message detailing where to find sandbox directory
   fprintf(stdout, "\nThe generated sandbox directory can be found at %s\n", sandbox_pwd);
