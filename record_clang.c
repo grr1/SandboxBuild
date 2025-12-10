@@ -5,6 +5,7 @@
  * This parser looks for lines in which the following conditions are met:
     1: the system call performed is "execve"
     2: the ending of the executable is "gcc", "g++", "ld", or "as"
+
  */
 
 #include <errno.h>
@@ -19,8 +20,52 @@
 #include <unistd.h>
 
 
+
 // constant for large buffer lengths
 #define BUFFER_SIZE 2000000
+
+/*
+ * Linked list node struct for syscalls in one strace output file
+ */
+typedef struct callnode_struct {
+  char *syscall;
+  char *args;
+  struct callnode_struct *next;
+  int pid;
+  int retVal;
+  bool isUnf; //mark unfinished lines
+  bool isRes; //mark resumed lines
+} callnode;
+
+/*
+ * Contains information about all commands listed in the strace output
+ */
+typedef struct call_list_struct {
+  callnode *head;
+  callnode *tail;
+} call_list;
+
+/*
+ * Add a syscall's information to the list of syscalls
+ */
+callnode *call_list_add(call_list *list, int pid, char *syscall, char *args,
+                        int retVal, int isUnf, int isRes) {
+  callnode *new = malloc(sizeof(callnode));
+  new->syscall = syscall;
+  new->pid = pid;
+  new->args = args;
+  //retVal is passed in as -1 in the case of unfinished, and changed to the 
+  new->retVal = retVal;
+  new->isUnf = isUnf;
+  new->isRes = isRes;
+  if ( list->head = NULL ) {
+    list->head = list->tail = new;
+  }
+  else {
+    list->tail->next = new;
+    list->tail = new;
+  }
+}
 
 /*
  * Linked list node struct for dependency files for one target
@@ -65,25 +110,6 @@ void TARGET_add_dep(target *tar, char *new_dep) {
   }
 }
 
-char *replace_extension(char *file, char *new_ext) {
-  char *new = malloc(strlen(file) + 4); //include space for .bc and .ll files when from .c
-  strcpy(new, file);
-  //find start of file extension
-  char *ext = strchr(new, '.');
-  if ( ext == NULL ) {
-    ext = new + strlen(new);
-  }
-  //fprintf(stderr, "NEWEXT: %s\n", ext);
-  int i = 0;
-  //replace file extension, starting with the .
-  for ( ; i < strlen(new_ext); i++ ) {
-    ext[i] = new_ext[i];
-  }
-  //null terminate new file
-  ext[i] = '\0';
-  return new;
-}
-
 /*
  * Emits the information needed to build one target to the generated sandbox makefile
  * params:
@@ -91,134 +117,26 @@ char *replace_extension(char *file, char *new_ext) {
  *    sb_pwd: the filepath to the sandbox, used to insert -I flag in gcc cmds
  *    tar:  pointer to the target struct containing the information to be writen
  */
-void emit_target_to_makefile(FILE *file, char *sb_pwd, target *tar, bool isClang) {
+void emit_target_to_makefile(FILE *file, char *sb_pwd, target *tar) {
   // first file is the local dependency
   // ex: target: target.cc
-  if ( !isClang ) {
-    fprintf(file, "\n%s: %s\n", tar->target_name, tar->head->dep);
-    // write the command to execute for this target
-    char *gcc_index = strstr(tar->cmd, "gcc");
-    if ( !gcc_index ) {
-      //if it is not a gcc command, check for a g++ command
-      gcc_index = strstr(tar->cmd, "g++");
-    }
-    if ( gcc_index ) {
-      //write all chars up to and including "gcc " in the command
-      fprintf(file, "\t");
-      fwrite(tar->cmd, 1, gcc_index - tar->cmd + 4, file);
-      fprintf(file, "-I%s %s\n", sb_pwd, gcc_index + 4);
-    }
-    else {
-      fprintf(file, "\t%s\n",tar->cmd); 
-    }
+  fprintf(file, "\n%s: %s\n", tar->target_name, tar->head->dep);
+  // write the command to execute for this target
+  //TODO: need to change to track multiple commands
+  //      to add sandbox directory to the linking path
+  char *gcc_index = strstr(tar->cmd, "gcc");
+  if ( !gcc_index ) {
+    //if it is not a gcc command, check for a g++ command
+    gcc_index = strstr(tar->cmd, "g++");
   }
-  else {  //emit using clang formatting
-
-    //write comment to file denoting original command
-    char *gcc_index = strstr(tar->cmd, "gcc");
-    
-    //use clang for gcc, clang++ for g++
-    char *CC = "clang";
-    if ( !gcc_index ) {
-      //if it is not a gcc command, check for a g++ command
-      gcc_index = strstr(tar->cmd, "g++");
-      CC = "clang++";
-    }
-    if ( gcc_index ) {
-      //write all chars up to and including "gcc " in the command
-      fprintf(file, "\n#");
-      fwrite(tar->cmd, 1, gcc_index - tar->cmd + 4, file);
-      fprintf(file, "-I%s %s\n", sb_pwd, gcc_index + 4);
-    }
-
-    // use clang formatting
-    char *tar_name = tar->target_name;
-    char *first = tar->head->dep;
-    int start = -1;
-    int end = -1;
-    if ( strstr(first, ".c") != NULL ) {
-      start = 1;
-    }
-    else if ( strstr(first, ".i") != NULL ) {
-      start = 2;
-    }
-    else if ( strstr(first, ".ll") != NULL ) {
-      start = 3;
-    }
-    else if ( strstr(first, ".bc") != NULL ) {
-      start = 4;
-    }
-    else if ( strstr(first, ".s") != NULL ) {
-      start = 5;
-    }
-    else if ( strstr(first, ".o") != NULL ) {
-      start = 6;
-    }
-    if ( strstr(tar_name, ".c") != NULL ) {
-      end = 1;
-    }
-    else if ( strstr(tar_name, ".i") != NULL ) {
-      end = 2;
-    }
-    else if ( strstr(tar_name, ".ll") != NULL ) {
-      end = 3;
-    }
-    else if ( strstr(tar_name, ".bc") != NULL ) {
-      end = 4;
-    }
-    else if ( strstr(tar_name, ".s") != NULL ) {
-      end = 5;
-    }
-    else if ( strstr(tar_name, ".o") != NULL ) {
-      end = 6;
-    }
-    else {
-      end = 7;
-    }
-    //temporary target file and dependency file
-    char *tempdep = strdup(first);
-    char *temptar = strdup(tar_name);
-    //c to i if necessary
-    if ( start == 1 && end > 1 ) {
-      temptar = replace_extension(temptar, ".i");
-      fprintf(file, "%s: %s\n", temptar, tempdep);
-      fprintf(file, "\t%s -I%s -E %s -o %s\n", CC, sb_pwd, tempdep, temptar);
-    }
-    //i to ll if necessary
-    if ( start <= 2 && end > 2 ) {
-      tempdep = replace_extension(tempdep, ".i");
-      temptar = replace_extension(temptar, ".ll");
-      fprintf(file, "\n%s: %s\n", temptar, tempdep);
-      fprintf(file, "\t%s -S -emit-llvm %s -o %s\n", CC, tempdep, temptar);
-    }
-    //ll to bc if necessary
-    if ( start <= 3&& end > 3 ) {
-      tempdep = replace_extension(tempdep, ".ll");
-      temptar = replace_extension(temptar, ".bc");
-      fprintf(file, "\n%s: %s\n", temptar, tempdep);
-      fprintf(file, "\t%s -c -emit-llvm %s -o %s\n", CC, tempdep, temptar);
-    }
-    //bc to s if necessary
-    if ( start <= 4 && end > 4 ) {
-      tempdep = replace_extension(tempdep, ".bc");
-      temptar = replace_extension(temptar, ".s");
-      fprintf(file, "\n%s: %s\n", temptar, tempdep);
-      fprintf(file, "\t%s -S  %s -o %s\n", CC, tempdep, temptar);
-    }
-    //s to o if necessary
-    if ( start <= 5 && end > 5 ) {
-      tempdep = replace_extension(tempdep, ".s");
-      temptar = replace_extension(temptar, ".o");
-      fprintf(file, "\n%s: %s\n", temptar, tempdep);
-      fprintf(file, "\t%s -c %s -o %s\n", CC, tempdep, temptar);
-    }
-    //o to executable if necessary
-    if ( start <= 5 && end > 5 ) {
-      tempdep = replace_extension(tempdep, ".o");
-      temptar = strdup(tar_name);
-      fprintf(file, "\n%s: %s\n", temptar, tempdep);
-      fprintf(file, "\t%s %s -o %s\n", CC, tempdep, temptar);
-    }
+  if ( gcc_index ) {
+    //write all chars up to and including "gcc " in the command
+    fprintf(file, "\t");
+    fwrite(tar->cmd, 1, gcc_index - tar->cmd + 4, file);
+    fprintf(file, "-I%s %s\n", sb_pwd, gcc_index + 4);
+  }
+  else {
+    fprintf(file, "\t%s\n",tar->cmd); 
   }
 }
 
@@ -407,7 +325,7 @@ char * parse_target_from_cmd(char *cmd) {
   if ( target_name != NULL ) {
     target_copy = strdup(target_name) + 3; // cut off "-o "
     int index = 0;
-    while ( target_copy[index] != ' ' && target_copy[index] != '\"' && target_copy[index] != ',' ) {
+    while ( target_copy[index] != ' ' ) {
       index++;
     }
     target_copy[index] = '\0';
@@ -540,11 +458,15 @@ FILE *sources_file = NULL;
 target *cur_target = NULL;
 // linked list to hold the filepaths of desired commands
 
-
+// parse a given line and add it to the linked list of syscalls
+void parse_line(char *line, call_list *calls) {
+  //TODO: parse line based on formats in copy.c
+  if ( strstr(line, "unfinished") != NULL ) {
+    //int scanret = sscanf(buffer, "%d %[^(]
+  }
+}
 
 int main(int argc, char *argv[]) {
-  //TODO: change to accept command line arg
-  bool isClang = true;
   FILE *in_file = NULL;
   if ( argc >= 2 && !strcmp(argv[1], "-s") ) {
     if ( argc != 3 ) {
@@ -566,9 +488,7 @@ int main(int argc, char *argv[]) {
     }
   }
   else {
-    // argv: "record-build" [targets] 
-    // argv: "record-build" -s [strace-output-file]
-
+    // argv: "record-build" [targets]
     // execvp("/usr/bin/strace", ["/usr/bin/strace", "-f", "-o", "t.out", "make", [targets]);
     // arguments for execve
     char *exec_args[argc + 10];
@@ -602,7 +522,6 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "ERROR: input file to be parsed,  %s, could not be opened!\n", input_file_name);
       exit(1);
     }
-
   }
 
   //open file to write list of commands to
@@ -626,6 +545,7 @@ int main(int argc, char *argv[]) {
     exit(1);
   }
 
+  //open file to write list of dependencies to
   dep_file = fopen(dependency_file_name, "w");
   if ( dep_file == NULL ) {
     //check for open failure
@@ -683,186 +603,19 @@ int main(int argc, char *argv[]) {
     fprintf(sandbox_mkfile, "\nall: all_make_targets\n");
   }
 
+  //keep track of all syscall info in the strace output
+  call_list *calls = malloc(sizeof(call_list));
 
-
-  //read one line in and compare it with the target format
+  //parse lines in to syscall linked list
   while(!feof(in_file) && fgets(bufferIn, sizeof(bufferIn), in_file) != NULL ) {
     // discard any lines that return -1 ENOENT, as these are commands that failed
     char *buffer = strdup(bufferIn);
-    if ( sscanf(buffer, "%d execve(\"%[^\n]\n", &pid, args) == 2  && strstr(args, "ENOENT") == NULL) {
-      // current line matches the desired format, check whether the command is one of
-      //  the desired commands: gcc, g++, ld, as
+    parse_line(buffer, calls);
 
-      // if previous line was a vfork, save the current pid and use it instead of newly read in one
-      if ( vfork ) {
-        pid = saved_pid;
-      }
-      else {
-        saved_pid = pid;
-      }
-
-      int command_end_index = 0; //the index of the " at the end of the filepath to the executed cmd
-      //TODO: change to strchr
-      for ( int i = 0; i < strlen(args); i++ ) {
-        if ( args[i] == '\"' ) {
-          break;
-        }
-        command_end_index++;
-      }
-      int command_start_index = 0; //the index of the first letter in the name of the command to be run
-      for ( int i = command_end_index - 1; i >= 0; i-- ) {
-        if ( args[i] == '/' ) {
-          command_start_index = i + 1;
-          break;
-        }
-      }
-
-      int cmd_len = command_end_index - command_start_index;
-      //TODO: strndup for next 2 lines
-      char *cmd_name = malloc(cmd_len + 1);
-      strncpy(cmd_name, args + command_start_index, cmd_len);
-      *(cmd_name + cmd_len) = '\0'; //null terminator
-
-      if ( is_desired_cmd(cmd_name) == true) {
-        if ( !strcmp(cmd_name, "gcc") || !strcmp(cmd_name, "g++") ) {
-          LIST_add(fps_list, pid, cmd_name);
-        }
-        /*
-        else if ( !strcmp(cmd_name, "sh") ) {
-          //TODO: executed /usr/bin/sh, how do i handle this?
-          fprintf(stderr, "/bin/sh executed!\n");
-        }
-        */
-        //parse the line and add appropriate entries in list of source files and list of commands
-        char *source = extract_sources(args);
-        if ( source != NULL ) {
-          fprintf(sources_file, "%s/%s\n", pwd, source);
-        }
-        // the arguments passed to the executable run by execve are formated as such:
-        //   ["arg1", "arg2", ..."argn"]
-        int lbracket_index = -1;
-        int rbracket_index = -1;
-        for ( int i = 0; i < strlen(args); i++ ) {
-          if ( args[i] == ']' ) {
-            rbracket_index = i;
-            break;
-          }
-          else if ( lbracket_index == -1 && args[i] == '[' ) {
-            lbracket_index = i;
-          }
-        }
-        char cmd_buffer[BUFFER_SIZE];
-        if ( !strcmp(cmd_name, "gcc") || !strcmp(cmd_name, "g++") ) {
-          //this is the start of a new target, need to output the old target to dependency file and
-          // copy the dependencies to sandbox dir
-          if ( cur_target != NULL ) {
-            emit_target_to_file(dep_file, cur_target);
-            TARGET_copy_deps(cur_target, sandbox_pwd);
-            emit_target_to_makefile(sandbox_mkfile, sandbox_pwd, cur_target, isClang);
-            //add the target to the list of make targets
-            //TODO: add the target's name to the dependencies of all_make_targets
-            //TARGET_add_dep(make_list, strdup(cur_target->target_name));
-            //fprintf(stderr, "new make target\n");
-            //fprintf(stderr, "MAKE_TARGET: \"%s\"\n", cur_target->target_name);
-            strcat(make_targets_list, " ");
-            strcat(make_targets_list, cur_target->target_name);
-          }
-          int i;
-          int cmd_index = 0;
-          for ( i = lbracket_index + 1; i < rbracket_index; i++ ) {
-            cmd_buffer[i] = args[i];
-            if ( args[i] != '\"' && args[i] != ',' ) {
-              if ( args[i] != '\0' ) {
-                fputc(args[i], cmds_file);
-                cmd_buffer[cmd_index] = args[i];
-                cmd_index++;
-              }
-            }
-          }
-          //TODO: free cur target's members here
-          cur_target = malloc(sizeof(target));
-          //parse the target file from the command
-          cmd_buffer[i] = '\0';
-          char *target_file = parse_target_from_cmd(cmd_buffer);
-          cmd_buffer[cmd_index] = '\0'; //null terminate the command buffer
-          cur_target->target_name = strndup(target_file, strlen(target_file));
-          cur_target->cmd = strndup(cmd_buffer, strlen(cmd_buffer));
-
-          // write newline in the commands file
-          fputc('\n', cmds_file);
-          if ( LIST_find_pid(fps_list, pid)  != NULL ) {
-            TARGET_add_dep(cur_target, source);
-          }
-        } // end if ( gcc/g++ cmd match)
-        else {
-          //TODO: check if the cmd is as or ld
-        }
-      }
-      free(cmd_name);
-    } // end if (sscanf format match)
-    else { // check for chdir calls, to change the current working directory appended to c/c++ file names
-      char *new_cwd = strstr(buffer, "chdir(");
-      if ( new_cwd != NULL ) { // syscall executed on this line was chdir, need to change cwd
-        pwd = new_cwd + 7; // cut off \"chdir("\" from the beginning of new_cwd
-        for ( int i = 0; i < strlen(pwd); i++ ) {
-          if ( pwd[i] == '\"' ) {
-            pwd[i] = '\0'; // null terminate the pathfile for the new working directory
-            break;
-          }
-        }
-      } // end if (chdir match)
-      else {
-        // check for openat
-        char *openat = strstr(buffer, "openat(");
-        //discard openat calls that return ENOENT, open failed
-        if ( openat != NULL && strstr(openat, "ENOENT") == NULL &&
-             ( LIST_find_pid(fps_list, pid) != NULL || strstr(openat, ".h") != NULL) ) {
-
-          //ignore locale files being opened
-          if ( strstr(openat, "locale") == NULL && strstr(openat, "/etc/") == NULL &&
-               strstr(openat, "/types/") == NULL && strstr(openat, ".cache") == NULL &&
-               strstr(openat, "/bits/") == NULL  && strstr(openat, "/tmp/") == NULL) {
-            openat += 18; // cut off "openat(AT_FDCWD, \""
-            for ( int i = 0; i < strlen(openat); i++ ) {
-              if ( openat[i] == '\"' ) {
-                openat[i] = '\0';
-                break;
-              }
-            }
-            TARGET_add_dep(cur_target, openat);
-          }
-        }
-        else {
-          //check for fork() calls
-          if ( strstr(buffer, "vfork(") != NULL && strstr(buffer, "unfinished") != NULL ) {
-            vfork = true;
-          }
-          else if ( strstr(buffer, "vfork resumed") != NULL ) {
-            vfork = false;
-          }
-        } // end else (openat match)
-      } //end else (chdir match)
-    } // end else (sscanf match);
-  } // end while
-
-  //emit the last target
-  if ( cur_target != NULL ) {
-    emit_target_to_file(dep_file, cur_target);
-    TARGET_copy_deps(cur_target, sandbox_pwd);
-    emit_target_to_makefile(sandbox_mkfile, sandbox_pwd, cur_target, isClang);
-    strcat(make_targets_list, " ");
-    strcat(make_targets_list, cur_target->target_name);
-  }
+  } // end parse lines
 
   //write the all_make_targets wrapper target at the end of the makefile
   fprintf(sandbox_mkfile, "\nall_make_targets:%s", make_targets_list);
-  fprintf(sandbox_mkfile, "\n\nclean:\n");
-  fprintf(sandbox_mkfile, "\trm *.i\n");
-  fprintf(sandbox_mkfile, "\trm *.ll\n");
-  fprintf(sandbox_mkfile, "\trm *.bc\n");
-  fprintf(sandbox_mkfile, "\trm *.s\n");
-  fprintf(sandbox_mkfile, "\trm *.o\n");
-  fprintf(sandbox_mkfile, "\trm%s\n", make_targets_list);
 
   //print message detailing where to find sandbox directory
   fprintf(stdout, "\nThe generated sandbox directory can be found at %s\n", sandbox_pwd);
